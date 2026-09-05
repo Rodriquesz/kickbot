@@ -1,0 +1,3 @@
+# Runs kickbot every 15 minutes. Install with: crontab -e
+# (adjust the path to where you cloned this project)
+*/15 * * * * cd /home/britzdan/Projects/kickbot && /home/britzdan/Projects/kickbot/.venv/bin/python run.py >> /home/britzdan/Projects/kickbot/logs/cron.out 2>&1
