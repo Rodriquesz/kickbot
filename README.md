@@ -20,7 +20,7 @@ Odds-API-Key nötig).
 ## Setup
 
 ```bash
-cd /home/britzdan/Projects/kickbot
+cd /home/user/Projects/kickbot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
