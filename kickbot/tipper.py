@@ -4,16 +4,8 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .browser import build_driver
 from .config import Config
-from .kicktipp import (
-    dismiss_consent_dialog,
-    extract_odds,
-    fetch_open_games,
-    fill_tip,
-    login,
-    submit_tips,
-)
+from .kicktipp import build_session, extract_odds, fetch_open_games, fill_tip, login, submit_tips
 from .notify import notify
 from .predictor import predict_score
 from .team_stats import fetch_recent_team_stats, stats_based_lambdas
@@ -25,15 +17,13 @@ BERLIN = ZoneInfo("Europe/Berlin")
 
 def run(config: Config, dry_run: bool = False) -> list[str]:
     """Run one pass. Returns a list of human-readable descriptions of tips placed."""
-    driver = build_driver(headless=config.headless)
+    session = build_session(config.user_agent)
     placed: list[str] = []
     missing_odds: list[str] = []
 
     try:
-        login(driver, config)
-        driver.get(config.tippabgabe_url)
-        dismiss_consent_dialog(driver)
-        games = fetch_open_games(driver)
+        login(session, config)
+        games, form_data, submit_url = fetch_open_games(session, config)
         logger.info("Found %d open games on the tipping page", len(games))
 
         team_stats = {}
@@ -92,7 +82,7 @@ def run(config: Config, dry_run: bool = False) -> list[str]:
             if dry_run:
                 logger.info("[DRY RUN] Would tip: %s", description)
             else:
-                fill_tip(game, home_goals, away_goals)
+                fill_tip(form_data, game, home_goals, away_goals)
                 logger.info("Tipped: %s", description)
 
             placed.append(description)
@@ -107,7 +97,7 @@ def run(config: Config, dry_run: bool = False) -> list[str]:
             )
 
         if placed and not dry_run:
-            submit_tips(driver)
+            submit_tips(session, submit_url, form_data)
             logger.info("Submitted %d tip(s)", len(placed))
         elif not placed:
             logger.info("Nothing to do - no forgotten tips within the lead time window")
@@ -115,4 +105,4 @@ def run(config: Config, dry_run: bool = False) -> list[str]:
         return placed
 
     finally:
-        driver.quit()
+        session.close()

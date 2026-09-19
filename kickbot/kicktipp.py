@@ -1,16 +1,22 @@
-"""Selenium interactions with kicktipp.de: login, reading open games, submitting tips."""
+"""Plain-HTTP interactions with kicktipp.de: login, reading open games, submitting tips.
+
+No browser needed: the login form and the tipping page are both ordinary
+server-rendered HTML forms (verified directly against kicktipp.de - no
+CSRF token, no JS challenge, session state is a plain cookie). This talks
+to them with `requests` + BeautifulSoup instead of driving a headless
+Chrome, which is what made this heavy enough to be a problem on something
+like a Raspberry Pi.
+"""
 
 import logging
-import time
+import re
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+import requests
+from bs4 import BeautifulSoup, Tag
 
 from .config import Config
 from .predictor import Odds
@@ -18,6 +24,8 @@ from .predictor import Odds
 logger = logging.getLogger("kickbot")
 
 BERLIN = ZoneInfo("Europe/Berlin")
+
+LOGIN_ACTION_URL = "https://www.kicktipp.de/info/profil/loginaction"
 
 # Kicktipp marks knockout-stage matches (extra time / penalties) with text
 # like "n.V." or "i.E.". A draw tip is rejected by Kicktipp for those.
@@ -37,74 +45,41 @@ class OpenGame:
     home_team: str
     away_team: str
     kickoff: datetime
-    home_input: WebElement
-    away_input: WebElement
+    home_field: str
+    away_field: str
     already_tipped: bool
     allow_draw: bool
-    row: WebElement
+    row: Tag
 
 
-def dismiss_consent_dialog(driver, timeout: float = 10) -> None:
-    """Dismiss the Sourcepoint cookie/ad-consent overlay if it's showing.
-
-    Kicktipp shows this on every fresh browser profile/session. Left in
-    place it can block clicks on elements underneath it (e.g. the tip
-    submit button) and can prevent the ad-served quote widgets from
-    loading at all. Persisting the Chrome profile (see browser.py) means
-    this is normally only needed once, but we check on every page load
-    since consent can be reset or shown again.
-
-    The consent script itself loads asynchronously after the page has
-    otherwise finished loading, so the timeout here is intentionally
-    generous - a run happens at most every few minutes via cron, so a
-    few extra seconds of waiting is cheap compared to missing the frame
-    and leaving the overlay in place.
-    """
-    try:
-        iframe = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'iframe[id*="sp_message_iframe"]'))
-        )
-    except TimeoutException:
-        return
-
-    try:
-        driver.switch_to.frame(iframe)
-        accept_button = WebDriverWait(driver, 4).until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    '//button[contains(., "Akzeptieren") or contains(., "Zustimmen") '
-                    'or contains(., "Einverstanden")]',
-                )
-            )
-        )
-        accept_button.click()
-        logger.debug("Dismissed cookie/ad consent dialog")
-    except TimeoutException:
-        logger.debug("Consent iframe present but no accept button found")
-    finally:
-        driver.switch_to.default_content()
+def build_session(user_agent: str) -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": user_agent,
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.5",
+        }
+    )
+    return session
 
 
-def login(driver, config: Config) -> None:
-    driver.get(config.LOGIN_URL)
-    wait = WebDriverWait(driver, 15)
+def login(session, config: Config) -> None:
+    # A plain GET first, mirroring a real browser visit - this is also
+    # where the session cookie gets set.
+    session.get(config.LOGIN_URL, timeout=20)
 
-    try:
-        wait.until(EC.presence_of_element_located((By.ID, "kennung")))
-    except TimeoutException as exc:
-        raise LoginError("Login page did not load (kennung field not found)") from exc
+    response = session.post(
+        LOGIN_ACTION_URL,
+        data={
+            "kennung": config.username,
+            "passwort": config.password,
+            "submitbutton": "Anmelden",
+        },
+        timeout=20,
+    )
 
-    dismiss_consent_dialog(driver)
-
-    driver.find_element(By.ID, "kennung").send_keys(config.username)
-    driver.find_element(By.ID, "passwort").send_keys(config.password)
-    driver.find_element(By.NAME, "submitbutton").click()
-
-    try:
-        wait.until(lambda d: "profil/login" not in d.current_url)
-    except TimeoutException as exc:
-        raise LoginError("Still on login page after submitting - check credentials") from exc
+    if "profil/login" in response.url:
+        raise LoginError("Still on login page after submitting - check credentials")
 
     logger.info("Logged in as %s", config.username)
 
@@ -125,28 +100,54 @@ def _disallows_draw(row_text: str) -> bool:
     return any(marker in normalized for marker in NO_DRAW_MARKERS)
 
 
-def fetch_open_games(driver) -> list[OpenGame]:
-    wait = WebDriverWait(driver, 15)
-    try:
-        wait.until(EC.presence_of_element_located((By.ID, "tippabgabeSpiele")))
-    except TimeoutException as exc:
-        raise TippingError("Tipping table (#tippabgabeSpiele) not found") from exc
+def _has_class(tag: Tag, needle: str) -> bool:
+    classes = tag.get("class") or []
+    return any(needle in c for c in classes)
 
-    rows = driver.find_elements(By.XPATH, '//*[@id="tippabgabeSpiele"]/tbody/tr')
+
+def fetch_open_games(session, config: Config) -> tuple[list[OpenGame], dict[str, str], str]:
+    """Fetch the tipping page and return (games, form_data, submit_url).
+
+    `form_data` holds every field of the tipping form as it currently is
+    (all matches, not just the ones we touch) - Kicktipp expects the whole
+    form back on submit, same as a browser would send it. `fill_tip()`
+    below just overwrites the relevant entries in that dict before it's
+    posted.
+    """
+    response = session.get(config.tippabgabe_url, timeout=20)
+    response.raise_for_status()
+    return _parse_tippabgabe_html(response.text, response.url, config.tippabgabe_url)
+
+
+def _parse_tippabgabe_html(
+    html: str, page_url: str, fallback_action: str
+) -> tuple[list[OpenGame], dict[str, str], str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    table = soup.find(id="tippabgabeSpiele")
+    if table is None:
+        raise TippingError("Tipping table (#tippabgabeSpiele) not found")
+
+    form = table.find_parent("form")
+    if form is None:
+        raise TippingError("No <form> found around the tipping table")
+
+    submit_url = urljoin(page_url, form.get("action") or fallback_action)
+    form_data = _extract_form_fields(form)
+
+    body = table.find("tbody") or table
+    rows = body.find_all("tr", recursive=False) or body.find_all("tr")
 
     games: list[OpenGame] = []
     last_kickoff: datetime | None = None
 
     for row in rows:
-        row_class = row.get_attribute("class") or ""
-        if "datarow" not in row_class:
+        cells = row.find_all("td", recursive=False) or row.find_all("td")
+        if len(cells) < 3:
+            # Not a game row (e.g. a matchday/date separator, if present).
             continue
 
-        try:
-            time_text = row.find_element(By.XPATH, "./td[1]").text
-        except NoSuchElementException:
-            time_text = ""
-
+        time_text = cells[0].get_text(strip=True)
         parsed = _parse_kickoff(time_text)
         if parsed is not None:
             last_kickoff = parsed
@@ -155,70 +156,94 @@ def fetch_open_games(driver) -> list[OpenGame]:
             logger.debug("Skipping row with no known kickoff time yet")
             continue
 
-        try:
-            home_team = row.find_element(By.XPATH, "./td[2]").text.strip()
-            away_team = row.find_element(By.XPATH, "./td[3]").text.strip()
-        except NoSuchElementException:
+        home_team = cells[1].get_text(strip=True)
+        away_team = cells[2].get_text(strip=True)
+        if not home_team or not away_team:
             continue
 
-        try:
-            home_input = row.find_element(By.XPATH, './/input[contains(@name, "heimTipp")]')
-            away_input = row.find_element(By.XPATH, './/input[contains(@name, "gastTipp")]')
-        except NoSuchElementException:
+        home_input = row.find("input", attrs={"name": re.compile("heimTipp")})
+        away_input = row.find("input", attrs={"name": re.compile("gastTipp")})
+        if home_input is None or away_input is None:
             # Game already finished or otherwise not tippable.
             continue
 
-        already_tipped = bool(home_input.get_attribute("value")) and bool(
-            away_input.get_attribute("value")
-        )
+        home_field = home_input.get("name")
+        away_field = away_input.get("name")
+        already_tipped = bool(home_input.get("value")) and bool(away_input.get("value"))
 
         games.append(
             OpenGame(
                 home_team=home_team,
                 away_team=away_team,
                 kickoff=kickoff,
-                home_input=home_input,
-                away_input=away_input,
+                home_field=home_field,
+                away_field=away_field,
                 already_tipped=already_tipped,
-                allow_draw=not _disallows_draw(row.text),
+                allow_draw=not _disallows_draw(row.get_text(" ", strip=True)),
                 row=row,
             )
         )
 
-    return games
+    return games, form_data, submit_url
 
 
-def extract_odds(row: WebElement) -> Odds | None:
-    container = None
-    for xpath in (
-        './/div[contains(@class, "tippabgabe-quoten")]',
-        './/td[contains(@class, "quoten")]',
-    ):
-        try:
-            container = row.find_element(By.XPATH, xpath)
-            break
-        except NoSuchElementException:
+def _extract_form_fields(form: Tag) -> dict[str, str]:
+    fields: dict[str, str] = {}
+
+    for input_tag in form.find_all("input"):
+        name = input_tag.get("name")
+        if not name:
             continue
+        input_type = (input_tag.get("type") or "text").lower()
+        if input_type in ("checkbox", "radio"):
+            if input_tag.has_attr("checked"):
+                fields[name] = input_tag.get("value", "on")
+            continue
+        if input_type in ("submit", "button", "image", "reset"):
+            continue
+        fields[name] = input_tag.get("value", "")
 
+    for select_tag in form.find_all("select"):
+        name = select_tag.get("name")
+        if not name:
+            continue
+        selected = select_tag.find("option", selected=True) or select_tag.find("option")
+        if selected is not None:
+            fields[name] = selected.get("value", selected.get_text(strip=True))
+
+    for textarea in form.find_all("textarea"):
+        name = textarea.get("name")
+        if name:
+            fields[name] = textarea.get_text()
+
+    submit_button = form.find("button", attrs={"name": "submitbutton"})
+    if submit_button is not None:
+        fields["submitbutton"] = submit_button.get("value", "")
+
+    return fields
+
+
+def extract_odds(row: Tag) -> Odds | None:
+    container = row.find("div", class_=lambda c: c and "tippabgabe-quoten" in c)
+    if container is None:
+        container = row.find("td", class_=lambda c: c and "quoten" in c)
     if container is None:
         return None
 
-    quote_elements = container.find_elements(
-        By.XPATH,
-        './/*[contains(@class, "quote")][.//span[contains(@class, "quote-label")]]',
-    )
+    quote_elements = [
+        el
+        for el in container.find_all(class_=lambda c: c and "quote" in c)
+        if el.find("span", class_=lambda c: c and "quote-label" in c)
+    ]
 
     mapping: dict[str, str] = {}
     for element in quote_elements:
-        try:
-            label = element.find_element(
-                By.XPATH, './/span[contains(@class, "quote-label")]'
-            ).text.strip()
-            value = element.find_element(
-                By.XPATH, './/span[contains(@class, "quote-text")]'
-            ).text.strip()
-        except NoSuchElementException:
+        label_el = element.find("span", class_=lambda c: c and "quote-label" in c)
+        text_el = element.find("span", class_=lambda c: c and "quote-text" in c)
+        if label_el is None or text_el is None:
             continue
+        label = label_el.get_text(strip=True)
+        value = text_el.get_text(strip=True)
         if label and value:
             mapping[label] = value
 
@@ -229,22 +254,21 @@ def extract_odds(row: WebElement) -> Odds | None:
         return float(raw.replace(",", "."))
 
     try:
-        return Odds(home=to_float(mapping["1"]), draw=to_float(mapping["X"]), away=to_float(mapping["2"]))
+        return Odds(
+            home=to_float(mapping["1"]), draw=to_float(mapping["X"]), away=to_float(mapping["2"])
+        )
     except ValueError:
         return None
 
 
-def fill_tip(game: OpenGame, home_goals: int, away_goals: int) -> None:
-    game.home_input.clear()
-    game.home_input.send_keys(str(home_goals))
-    game.away_input.clear()
-    game.away_input.send_keys(str(away_goals))
+def fill_tip(form_data: dict[str, str], game: OpenGame, home_goals: int, away_goals: int) -> None:
+    form_data[game.home_field] = str(home_goals)
+    form_data[game.away_field] = str(away_goals)
 
 
-def submit_tips(driver) -> None:
-    driver.find_element(By.NAME, "submitbutton").click()
-    time.sleep(1)
+def submit_tips(session, submit_url: str, form_data: dict[str, str]) -> None:
+    response = session.post(submit_url, data=form_data, timeout=20)
+    response.raise_for_status()
 
-    body_text = driver.find_element(By.TAG_NAME, "body").text.casefold()
-    if "nicht alle gesendeten tipps waren korrekt" in body_text:
+    if "nicht alle gesendeten tipps waren korrekt" in response.text.casefold():
         raise TippingError("Kicktipp rejected the submitted tips - check the tipping page manually")

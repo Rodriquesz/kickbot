@@ -23,7 +23,7 @@ class Config:
     community: str
     tip_lead_time_minutes: int
     skip_already_tipped: bool
-    headless: bool
+    user_agent: str
     ntfy_topic: Optional[str]
     ntfy_url: str
     webhook_url: Optional[str]
@@ -66,7 +66,11 @@ class Config:
             community=community,
             tip_lead_time_minutes=int(os.getenv("TIP_LEAD_TIME_MINUTES", "90")),
             skip_already_tipped=_bool("SKIP_ALREADY_TIPPED", True),
-            headless=_bool("HEADLESS", True),
+            user_agent=os.getenv(
+                "USER_AGENT",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            ),
             ntfy_topic=os.getenv("NTFY_TOPIC"),
             ntfy_url=os.getenv("NTFY_URL", "https://ntfy.sh"),
             webhook_url=os.getenv("WEBHOOK_URL"),

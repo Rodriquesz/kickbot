@@ -37,7 +37,6 @@ def main() -> int:
     parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be tipped without submitting"
     )
-    parser.add_argument("--headed", action="store_true", help="Show the browser window")
     parser.add_argument("--verbose", action="store_true", help="Debug logging")
     args = parser.parse_args()
 
@@ -55,8 +54,6 @@ def main() -> int:
 
     try:
         config = Config.load()
-        if args.headed:
-            config = Config(**{**config.__dict__, "headless": False})
 
         try:
             run(config, dry_run=args.dry_run)

@@ -6,4 +6,3 @@ venv/
 logs/
 *.log
 .kickbot.lock
-.chrome-profile/
